@@ -32,3 +32,4 @@ ENTRYPOINT ["python", "ksef_faktury_list.py"]
 
 # Default help command
 CMD ["--help"]
+

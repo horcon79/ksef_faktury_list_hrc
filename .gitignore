@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+token.txt
+token_*.txt
+smtp_haslo.txt
+smtp_haslo_*.txt
+*.key
+*.pem
+*.p12
+*.pfx
+output/

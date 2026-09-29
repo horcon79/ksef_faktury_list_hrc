@@ -27,3 +27,6 @@ password.txt
 output/
 faktury_xml/
 faktury_pdf/
+.kilo/
+
+

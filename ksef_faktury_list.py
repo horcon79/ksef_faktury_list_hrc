@@ -52,6 +52,7 @@ Options:
     --date-from     Start date YYYY-MM-DD (default: 30 days ago)
     --date-to       End date YYYY-MM-DD (default: today)
     --subject-type  Subject1 (issued/sales) or Subject2 (received/purchases), default: Subject2
+    --is-self-invoicing [true|false]  Filter self-invoicing (alias: --isSelfInvoicing)
     --output        Output format: table, json, xml (default: table)
     --download-xml  Download full XML for each invoice
     --download-pdf  Generate PDF for each invoice
@@ -914,7 +915,8 @@ class KSeFClient:
         date_to: datetime.date = None,
         date_type: str = 'Invoicing',
         page_size: int = 100,
-        page_offset: int = 0
+        page_offset: int = 0,
+        is_self_invoicing: Optional[bool] = None
     ) -> dict:
         """
         Search invoices in KSeF.
@@ -928,6 +930,8 @@ class KSeFClient:
             date_type: Date type ('Issue' or 'Invoicing')
             page_size: Results per page (max 250)
             page_offset: Page offset
+            is_self_invoicing: True=self-invoicing only, False=exclude self-invoicing,
+                None=no filter (original behavior)
 
         Returns:
             dict with invoice metadata list
@@ -954,6 +958,11 @@ class KSeFClient:
                 "to": f"{date_to.isoformat()}T23:59:59"
             }
         }
+
+        if is_self_invoicing is not None:
+            if not isinstance(is_self_invoicing, bool):
+                raise ValueError('is_self_invoicing must be bool or None')
+            data['isSelfInvoicing'] = is_self_invoicing
 
         query_params = f"?pageSize={min(page_size, 250)}&pageOffset={page_offset}"
         endpoint = f"/invoices/query/metadata{query_params}"
@@ -1755,6 +1764,16 @@ def send_grouped_email(
         logger.info(f"Email zbiorczy wysłany pomyślnie ({len(invoices_data)} faktur, {attachment_count} załączników)")
 
 
+def parse_boolean_argument(value: str) -> bool:
+    """Parse explicit booleans without treating the string 'false' as True."""
+    normalized = value.strip().lower()
+    if normalized == 'true':
+        return True
+    if normalized == 'false':
+        return False
+    raise argparse.ArgumentTypeError('Expected true or false / oczekiwano true albo false')
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Fetch invoices from KSeF (Krajowy System e-Faktur)',
@@ -1772,6 +1791,10 @@ Examples:
     # With options
     %(prog)s --nip 1234567890 --token-file token.txt --env prod --date-from 2025-01-01
     %(prog)s --nip 1234567890 --token-file token.txt --download-pdf --pdf-output-dir ./pdf
+
+    # Self-invoicing only (all original XML/PDF/email options remain available)
+    %(prog)s --nip 1234567890 --token-file token.txt --is-self-invoicing --subject-type Subject1 --download-pdf
+    %(prog)s --nip 1234567890 --token-file token.txt --isSelfInvoicing true
 
     # Offline XML to PDF conversion (no authentication needed)
     %(prog)s --xml-to-pdf faktura.xml
@@ -1803,6 +1826,11 @@ Examples:
     parser.add_argument('--date-to', help='End date YYYY-MM-DD (default: today)')
     parser.add_argument('--subject-type', choices=['Subject1', 'Subject2'], default='Subject2',
                         help='Subject1=issued/sales, Subject2=received/purchases (default: Subject2)')
+    parser.add_argument('--is-self-invoicing', '--isSelfInvoicing', dest='is_self_invoicing',
+                        type=parse_boolean_argument, nargs='?', const=True, default=None,
+                        metavar='{true,false}',
+                        help='Filter self-invoicing: true=only self-invoicing, false=exclude; '
+                             'flag without value means true; omitted=no filter')
     parser.add_argument('--output', choices=['table', 'json'], default='table',
                         help='Output format (default: table)')
     parser.add_argument('--download-xml', action='store_true',
@@ -1997,11 +2025,14 @@ Examples:
         print(f"\nPobieranie faktur {subject_type_label}...")
         if date_from:
             print(f"Zakres dat: {date_from} - {date_to or 'dziś'}")
+        if args.is_self_invoicing is not None:
+            print(f"Filtr isSelfInvoicing: {str(args.is_self_invoicing).lower()}")
 
         result = client.query_invoices(
             subject_type=args.subject_type,
             date_from=date_from,
-            date_to=date_to
+            date_to=date_to,
+            is_self_invoicing=args.is_self_invoicing
         )
 
         invoices = result.get('invoices', [])
