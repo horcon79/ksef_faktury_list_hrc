@@ -336,67 +336,85 @@ class KSeFClient:
         if data:
             logger.debug(f"KSeF Request data: {json.dumps(data, indent=2)}")
 
-        try:
-            if method.upper() == 'GET':
-                response = requests.get(url, headers=headers, timeout=self.timeout)
-            elif method.upper() == 'POST':
-                if xml_data:
-                    response = requests.post(
-                        url, headers=headers, data=xml_data.encode('utf-8'), timeout=self.timeout
-                    )
-                else:
-                    response = requests.post(
-                        url, headers=headers, json=data, timeout=self.timeout
-                    )
-            elif method.upper() == 'DELETE':
-                response = requests.delete(url, headers=headers, timeout=self.timeout)
-            else:
-                raise ValueError(f"Unsupported HTTP method: {method}")
-
-            logger.info(f"KSeF Response: {response.status_code}")
-            logger.debug(f"KSeF Response body: {response.text[:2000] if response.text else 'EMPTY'}")
-
-            content_type = response.headers.get('Content-Type', '')
-
-            if response.status_code >= 400:
-                error_msg = f"KSeF API Error: HTTP {response.status_code}"
-                error_data = {}
-                try:
-                    if 'application/json' in content_type:
-                        error_data = response.json()
-                        if 'exception' in error_data:
-                            exc = error_data['exception']
-                            detail_list = exc.get('exceptionDetailList', [])
-                            if detail_list:
-                                error_msg = detail_list[0].get('exceptionDescription', error_msg)
-                        elif 'message' in error_data:
-                            error_msg = error_data['message']
+        max_retries = 3
+        retry_delay = 2.0
+        for attempt in range(1, max_retries + 1):
+            try:
+                if method.upper() == 'GET':
+                    response = requests.get(url, headers=headers, timeout=self.timeout)
+                elif method.upper() == 'POST':
+                    if xml_data:
+                        response = requests.post(
+                            url, headers=headers, data=xml_data.encode('utf-8'), timeout=self.timeout
+                        )
                     else:
-                        error_data = {'raw': response.text[:500], 'content_type': content_type}
-                except json.JSONDecodeError:
-                    error_data = {'raw': response.text[:500], 'content_type': content_type}
-
-                raise KSeFError(
-                    message=error_msg,
-                    status_code=response.status_code,
-                    response_data=error_data
-                )
-
-            if response.text:
-                if 'application/json' in content_type:
-                    return response.json()
-                elif any(ct in content_type for ct in ['application/octet-stream', 'text/xml', 'application/xml']):
-                    return {'raw_content': response.text}
+                        response = requests.post(
+                            url, headers=headers, json=data, timeout=self.timeout
+                        )
+                elif method.upper() == 'DELETE':
+                    response = requests.delete(url, headers=headers, timeout=self.timeout)
                 else:
-                    try:
-                        return response.json()
-                    except json.JSONDecodeError:
-                        return {'raw_content': response.text}
-            return {}
+                    raise ValueError(f"Unsupported HTTP method: {method}")
 
-        except requests.RequestException as e:
-            logger.error(f"KSeF Request Error: {e}")
-            raise KSeFError(message=f"Connection error with KSeF: {str(e)}")
+                logger.info(f"KSeF Response: {response.status_code}")
+                logger.debug(f"KSeF Response body: {response.text[:2000] if response.text else 'EMPTY'}")
+
+                if response.status_code == 429 and attempt < max_retries:
+                    wait_time = retry_delay
+                    retry_after = response.headers.get('Retry-After')
+                    if retry_after:
+                        try:
+                            wait_time = max(float(retry_after), retry_delay)
+                        except (ValueError, TypeError):
+                            pass
+                    logger.warning(
+                        f"KSeF rate limit (429) dla {endpoint}. "
+                        f"Oczekiwanie {wait_time}s przed ponowieniem (próba {attempt}/{max_retries})..."
+                    )
+                    time.sleep(wait_time)
+                    continue
+
+                content_type = response.headers.get('Content-Type', '')
+
+                if response.status_code >= 400:
+                    error_msg = f"KSeF API Error: HTTP {response.status_code}"
+                    error_data = {}
+                    try:
+                        if 'application/json' in content_type:
+                            error_data = response.json()
+                            if 'exception' in error_data:
+                                exc = error_data['exception']
+                                detail_list = exc.get('exceptionDetailList', [])
+                                if detail_list:
+                                    error_msg = detail_list[0].get('exceptionDescription', error_msg)
+                            elif 'message' in error_data:
+                                error_msg = error_data['message']
+                        else:
+                            error_data = {'raw': response.text[:500], 'content_type': content_type}
+                    except json.JSONDecodeError:
+                        error_data = {'raw': response.text[:500], 'content_type': content_type}
+
+                    raise KSeFError(
+                        message=error_msg,
+                        status_code=response.status_code,
+                        response_data=error_data
+                    )
+
+                if response.text:
+                    if 'application/json' in content_type:
+                        return response.json()
+                    elif any(ct in content_type for ct in ['application/octet-stream', 'text/xml', 'application/xml']):
+                        return {'raw_content': response.text}
+                    else:
+                        try:
+                            return response.json()
+                        except json.JSONDecodeError:
+                            return {'raw_content': response.text}
+                return {}
+
+            except requests.RequestException as e:
+                logger.error(f"KSeF Request Error: {e}")
+                raise KSeFError(message=f"Connection error with KSeF: {str(e)}")
 
     def _build_auth_token_request_xml(self, challenge: str, nip: str, timestamp: str) -> str:
         """
@@ -969,12 +987,14 @@ class KSeFClient:
 
         return self._make_request('POST', endpoint, data=data, with_session=True)
 
-    def get_invoice_xml(self, ksef_number: str) -> bytes:
+    def get_invoice_xml(self, ksef_number: str, max_retries: int = 3, retry_delay: float = 2.0) -> bytes:
         """
         Download invoice XML from KSeF.
 
         Args:
             ksef_number: KSeF invoice number
+            max_retries: Maximum number of attempts on rate limit (429) (default: 3)
+            retry_delay: Delay in seconds between retries (default: 2.0)
 
         Returns:
             Invoice XML as raw bytes (preserving original encoding for QR hash)
@@ -986,15 +1006,31 @@ class KSeFClient:
         headers = self._get_headers(with_session=True)
         headers['Accept'] = 'application/octet-stream'
 
-        response = requests.get(url, headers=headers, timeout=self.timeout)
+        for attempt in range(1, max_retries + 1):
+            response = requests.get(url, headers=headers, timeout=self.timeout)
 
-        if response.status_code >= 400:
-            raise KSeFError(
-                message=f"Error downloading invoice XML: {response.status_code}",
-                status_code=response.status_code
-            )
+            if response.status_code == 429 and attempt < max_retries:
+                wait_time = retry_delay
+                retry_after = response.headers.get('Retry-After')
+                if retry_after:
+                    try:
+                        wait_time = max(float(retry_after), retry_delay)
+                    except (ValueError, TypeError):
+                        pass
+                logger.warning(
+                    f"KSeF rate limit (429) dla {ksef_number}. "
+                    f"Oczekiwanie {wait_time}s przed ponowieniem (próba {attempt}/{max_retries})..."
+                )
+                time.sleep(wait_time)
+                continue
 
-        return response.content
+            if response.status_code >= 400:
+                raise KSeFError(
+                    message=f"Error downloading invoice XML: {response.status_code}",
+                    status_code=response.status_code
+                )
+
+            return response.content
 
 
 class InvoicePDFGenerator:
@@ -2049,7 +2085,28 @@ Examples:
 
         def get_xml_cached(ksef_number):
             if ksef_number not in xml_cache:
-                xml_cache[ksef_number] = client.get_invoice_xml(ksef_number)
+                # Sprawdzenie obecności pliku na dysku (odczyt z dysku w cache)
+                safe_name = ksef_number.replace('/', '_').replace('\\', '_')
+                candidate_paths = []
+                if getattr(args, 'xml_output_dir', None):
+                    candidate_paths.append(os.path.join(args.xml_output_dir, f"{safe_name}.xml"))
+                candidate_paths.append(f"{safe_name}.xml")
+
+                for disk_path in candidate_paths:
+                    if os.path.isfile(disk_path) and os.path.getsize(disk_path) > 0:
+                        try:
+                            with open(disk_path, 'rb') as f:
+                                data = f.read()
+                            if data:
+                                xml_cache[ksef_number] = data
+                                logger.info(f"Wczytano XML z dysku dla {ksef_number}: {disk_path}")
+                                return data
+                        except Exception as e:
+                            logger.warning(f"Błąd odczytu XML z dysku ({disk_path}): {e}")
+
+                xml_data = client.get_invoice_xml(ksef_number)
+                xml_cache[ksef_number] = xml_data
+                time.sleep(0.3)  # Throttling zapytań do API (0.3s)
             return xml_cache[ksef_number]
 
         # Download XML if requested
@@ -2061,12 +2118,13 @@ Examples:
                 ksef_number = inv.get('ksefNumber')
                 if ksef_number:
                     try:
-                        xml_raw = get_xml_cached(ksef_number)
-                        # Sanitize filename
                         safe_name = ksef_number.replace('/', '_').replace('\\', '_')
                         filepath = os.path.join(args.xml_output_dir, f"{safe_name}.xml")
-                        with open(filepath, 'wb') as f:
-                            f.write(xml_raw)
+                        already_on_disk = os.path.isfile(filepath) and os.path.getsize(filepath) > 0
+                        xml_raw = get_xml_cached(ksef_number)
+                        if not already_on_disk or not os.path.isfile(filepath):
+                            with open(filepath, 'wb') as f:
+                                f.write(xml_raw)
                         print(f"  Pobrano: {filepath}")
                     except KSeFError as e:
                         print(f"  Błąd pobierania {ksef_number}: {e.message}", file=sys.stderr)

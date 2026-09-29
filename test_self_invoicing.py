@@ -114,5 +114,96 @@ class FilterTests(unittest.TestCase):
                 c.terminate_session.assert_called_once()
 
 
+class RateLimitAndCacheTests(unittest.TestCase):
+    @patch('ksef_faktury_list.time.sleep')
+    @patch('ksef_faktury_list.requests.get')
+    def test_get_invoice_xml_retry_429_success(self, mock_get, mock_sleep):
+        client = app.KSeFClient.from_token('token', environment='test')
+        client.access_token = 'active-session-token'
+
+        # First 2 calls return 429 (one with Retry-After header), 3rd returns 200
+        resp_429_1 = Mock(status_code=429, headers={'Retry-After': '3'})
+        resp_429_2 = Mock(status_code=429, headers={})
+        resp_200 = Mock(status_code=200, content=b'<xml>ok</xml>')
+        mock_get.side_effect = [resp_429_1, resp_429_2, resp_200]
+
+        result = client.get_invoice_xml('1234567890-20260928-010080615740-E4')
+        self.assertEqual(result, b'<xml>ok</xml>')
+        self.assertEqual(mock_get.call_count, 3)
+        # First retry waited 3.0s (from Retry-After), second waited 2.0s (default)
+        self.assertEqual(mock_sleep.call_args_list, [
+            unittest.mock.call(3.0),
+            unittest.mock.call(2.0),
+        ])
+
+    @patch('ksef_faktury_list.time.sleep')
+    @patch('ksef_faktury_list.requests.get')
+    def test_get_invoice_xml_retry_429_exhausted(self, mock_get, mock_sleep):
+        client = app.KSeFClient.from_token('token', environment='test')
+        client.access_token = 'active-session-token'
+
+        resp_429 = Mock(status_code=429, headers={})
+        mock_get.return_value = resp_429
+
+        with self.assertRaises(app.KSeFError) as cm:
+            client.get_invoice_xml('1234567890-20260928-010080615740-E4', max_retries=3, retry_delay=2.0)
+
+        self.assertEqual(cm.exception.status_code, 429)
+        self.assertEqual(mock_get.call_count, 3)
+        self.assertEqual(mock_sleep.call_count, 2)  # retried twice after attempts 1 and 2
+
+    @patch('ksef_faktury_list.time.sleep')
+    def test_disk_cache_skips_api_call(self, mock_sleep):
+        with tempfile.TemporaryDirectory() as temp:
+            ksef_nr = '1234567890-20260928-010080615740-E4'
+            xml_file = Path(temp) / f"{ksef_nr}.xml"
+            xml_file.write_bytes(XML)
+
+            c = app.KSeFClient.from_token('offline', environment='prod')
+            c.access_token = 'offline'
+            c.init_session_token = Mock(return_value={'reference_number': 'offline'})
+            c.terminate_session = Mock()
+            c.get_invoice_xml = Mock()
+            c._make_request = Mock(return_value={'invoices': [{'ksefNumber': ksef_nr, 'invoiceNumber': 'INV/1'}]})
+
+            argv = ['script', '--nip', '1234567890', '--token', 'offline',
+                    '--download-xml', '--xml-output-dir', temp,
+                    '--download-pdf', '--pdf-output-dir', temp]
+
+            with patch.object(app.KSeFClient, 'from_token', return_value=c), \
+                 patch('sys.argv', argv), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                app.main()
+
+            # get_invoice_xml should NOT be called at all because file was already on disk
+            c.get_invoice_xml.assert_not_called()
+            mock_sleep.assert_not_called()
+            pdf_path = Path(temp) / f"{ksef_nr}.pdf"
+            self.assertTrue(pdf_path.is_file())
+
+    @patch('ksef_faktury_list.time.sleep')
+    def test_throttling_on_api_fetch(self, mock_sleep):
+        with tempfile.TemporaryDirectory() as temp:
+            ksef_nr = '1234567890-20260928-010080615740-E4'
+            c = app.KSeFClient.from_token('offline', environment='prod')
+            c.access_token = 'offline'
+            c.init_session_token = Mock(return_value={'reference_number': 'offline'})
+            c.terminate_session = Mock()
+            c.get_invoice_xml = Mock(return_value=XML)
+            c._make_request = Mock(return_value={'invoices': [{'ksefNumber': ksef_nr, 'invoiceNumber': 'INV/1'}]})
+
+            argv = ['script', '--nip', '1234567890', '--token', 'offline',
+                    '--download-xml', '--xml-output-dir', temp]
+
+            with patch.object(app.KSeFClient, 'from_token', return_value=c), \
+                 patch('sys.argv', argv), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                app.main()
+
+            c.get_invoice_xml.assert_called_once_with(ksef_nr)
+            mock_sleep.assert_called_once_with(0.3)
+
+
 if __name__ == '__main__':
     unittest.main()
+
