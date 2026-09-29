@@ -53,6 +53,7 @@ Options:
     --date-to       End date YYYY-MM-DD (default: today)
     --subject-type  Subject1 (issued/sales) or Subject2 (received/purchases), default: Subject2
     --is-self-invoicing [true|false]  Filter self-invoicing (alias: --isSelfInvoicing)
+    --buyer-nip NIP Filter invoices by buyer NIP (alias: --buyerNip)
     --output        Output format: table, json, xml (default: table)
     --download-xml  Download full XML for each invoice
     --download-pdf  Generate PDF for each invoice
@@ -934,7 +935,8 @@ class KSeFClient:
         date_type: str = 'Invoicing',
         page_size: int = 100,
         page_offset: int = 0,
-        is_self_invoicing: Optional[bool] = None
+        is_self_invoicing: Optional[bool] = None,
+        buyer_nip: Optional[str] = None
     ) -> dict:
         """
         Search invoices in KSeF.
@@ -950,12 +952,20 @@ class KSeFClient:
             page_offset: Page offset
             is_self_invoicing: True=self-invoicing only, False=exclude self-invoicing,
                 None=no filter (original behavior)
+            buyer_nip: Optional buyer NIP (nabywca) to filter results
 
         Returns:
             dict with invoice metadata list
         """
         if not self.access_token:
             raise KSeFError("No active session")
+
+        if buyer_nip is not None:
+            clean_target = str(buyer_nip).strip().replace('-', '').replace(' ', '')
+            if clean_target.upper().startswith('PL'):
+                clean_target = clean_target[2:]
+            if not (clean_target.isdigit() and len(clean_target) == 10):
+                raise ValueError(f"Nieprawidłowy NIP nabywcy: '{buyer_nip}'. Wymagane 10 cyfr.")
 
         if date_to is None:
             date_to = datetime.date.today()
@@ -985,7 +995,22 @@ class KSeFClient:
         query_params = f"?pageSize={min(page_size, 250)}&pageOffset={page_offset}"
         endpoint = f"/invoices/query/metadata{query_params}"
 
-        return self._make_request('POST', endpoint, data=data, with_session=True)
+        response = self._make_request('POST', endpoint, data=data, with_session=True)
+
+        if buyer_nip is not None and isinstance(response, dict) and 'invoices' in response:
+            original_count = len(response['invoices'])
+            response['invoices'] = [
+                inv for inv in response['invoices']
+                if extract_buyer_nip(inv) == clean_target
+            ]
+            logger.info(
+                f"Przefiltrowano faktury po NIP nabywcy {clean_target}: "
+                f"{len(response['invoices'])}/{original_count}"
+            )
+            if 'numberOfElements' in response:
+                response['numberOfElements'] = len(response['invoices'])
+
+        return response
 
     def get_invoice_xml(self, ksef_number: str, max_retries: int = 3, retry_delay: float = 2.0) -> bytes:
         """
@@ -1626,6 +1651,50 @@ class InvoicePDFGenerator:
         return output_path
 
 
+def extract_buyer_nip(inv: dict) -> Optional[str]:
+    """Extract buyer NIP from invoice metadata dictionary."""
+    if not isinstance(inv, dict):
+        return None
+
+    buyer = inv.get('buyer')
+    if isinstance(buyer, dict):
+        if buyer.get('nip'):
+            val = str(buyer['nip']).strip().replace('-', '').replace(' ', '')
+            if val.upper().startswith('PL'):
+                val = val[2:]
+            return val
+        identifier = buyer.get('identifier')
+        if isinstance(identifier, dict):
+            raw = identifier.get('value') or identifier.get('nip')
+            if raw:
+                val = str(raw).strip().replace('-', '').replace(' ', '')
+                if val.upper().startswith('PL'):
+                    val = val[2:]
+                return val
+        elif isinstance(identifier, str):
+            val = identifier.strip().replace('-', '').replace(' ', '')
+            if val.upper().startswith('PL'):
+                val = val[2:]
+            return val
+
+    for field in ('buyerNip', 'buyer_nip', 'buyerIdentifier'):
+        raw = inv.get(field)
+        if isinstance(raw, str):
+            val = raw.strip().replace('-', '').replace(' ', '')
+            if val.upper().startswith('PL'):
+                val = val[2:]
+            return val
+        elif isinstance(raw, dict):
+            val_inner = raw.get('value') or raw.get('nip')
+            if val_inner:
+                val = str(val_inner).strip().replace('-', '').replace(' ', '')
+                if val.upper().startswith('PL'):
+                    val = val[2:]
+                return val
+
+    return None
+
+
 def format_amount(amount) -> str:
     """Format amount for display."""
     if amount is None:
@@ -1643,23 +1712,25 @@ def print_invoices_table(invoices: list):
         return
 
     # Nagłówek
-    print("\n" + "=" * 120)
-    print(f"{'Numer KSeF':<45} {'Nr faktury':<20} {'Data':<12} {'NIP sprzed.':<12} {'Kwota brutto':>15}")
-    print("=" * 120)
+    print("\n" + "=" * 135)
+    print(f"{'Numer KSeF':<45} {'Nr faktury':<20} {'Data':<12} {'NIP sprzed.':<13} {'NIP nabywcy':<13} {'Kwota brutto':>15}")
+    print("=" * 135)
 
     for inv in invoices:
-        ksef_num = inv.get('ksefNumber', 'N/A')[:44]
+        ksef_num = (inv.get('ksefNumber') or inv.get('ksefReferenceNumber', 'N/A'))[:44]
         inv_num = inv.get('invoiceNumber', 'N/A')[:19]
         inv_date = inv.get('issueDate', 'N/A')[:11]
 
         seller = inv.get('seller', {})
         seller_nip = seller.get('nip', 'N/A') if isinstance(seller, dict) else 'N/A'
 
+        buyer_nip = extract_buyer_nip(inv) or 'N/A'
+
         gross = format_amount(inv.get('grossAmount'))
 
-        print(f"{ksef_num:<45} {inv_num:<20} {inv_date:<12} {seller_nip:<12} {gross:>15}")
+        print(f"{ksef_num:<45} {inv_num:<20} {inv_date:<12} {seller_nip:<13} {buyer_nip:<13} {gross:>15}")
 
-    print("=" * 120)
+    print("=" * 135)
     print(f"Razem: {len(invoices)} faktur(a/y)")
 
 
@@ -1810,6 +1881,18 @@ def parse_boolean_argument(value: str) -> bool:
     raise argparse.ArgumentTypeError('Expected true or false / oczekiwano true albo false')
 
 
+def parse_nip(value: str) -> str:
+    """Validate and normalize NIP (10 digits, optional PL prefix and hyphens/spaces)."""
+    val = value.strip().replace('-', '').replace(' ', '')
+    if val.upper().startswith('PL'):
+        val = val[2:]
+    if not (val.isdigit() and len(val) == 10):
+        raise argparse.ArgumentTypeError(
+            f"Nieprawidłowy format NIP: '{value}'. Wymagane 10 cyfr (np. 1234567890 lub 123-456-78-90)."
+        )
+    return val
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Fetch invoices from KSeF (Krajowy System e-Faktur)',
@@ -1867,6 +1950,9 @@ Examples:
                         metavar='{true,false}',
                         help='Filter self-invoicing: true=only self-invoicing, false=exclude; '
                              'flag without value means true; omitted=no filter')
+    parser.add_argument('--buyer-nip', '--buyerNip', dest='buyer_nip',
+                        type=parse_nip, default=None, metavar='NIP',
+                        help='Filter invoices by buyer NIP (nabywca): e.g. 1234567890 or 123-456-78-90')
     parser.add_argument('--output', choices=['table', 'json'], default='table',
                         help='Output format (default: table)')
     parser.add_argument('--download-xml', action='store_true',
@@ -2063,12 +2149,15 @@ Examples:
             print(f"Zakres dat: {date_from} - {date_to or 'dziś'}")
         if args.is_self_invoicing is not None:
             print(f"Filtr isSelfInvoicing: {str(args.is_self_invoicing).lower()}")
+        if args.buyer_nip:
+            print(f"Filtr NIP nabywcy: {args.buyer_nip}")
 
         result = client.query_invoices(
             subject_type=args.subject_type,
             date_from=date_from,
             date_to=date_to,
-            is_self_invoicing=args.is_self_invoicing
+            is_self_invoicing=args.is_self_invoicing,
+            buyer_nip=args.buyer_nip
         )
 
         invoices = result.get('invoices', [])

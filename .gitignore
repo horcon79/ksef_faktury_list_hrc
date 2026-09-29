@@ -13,3 +13,5 @@ smtp_haslo_*.txt
 *.p12
 *.pfx
 output/
+certs/
+/.kilo
