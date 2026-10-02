@@ -57,6 +57,8 @@ Options:
     --output        Output format: table, json, xml (default: table)
     --download-xml  Download full XML for each invoice
     --download-pdf  Generate PDF for each invoice
+    --teams-webhook-url  Teams webhook URL for success/error notifications
+                        (fallback: TEAMS_WEBHOOK_URL environment variable)
     --verbose       Enable verbose logging
 """
 
@@ -95,6 +97,11 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
 import qrcode
+
+try:
+    from teams_notifier import send_teams_message
+except ImportError:  # script stays runnable without teams_notifier.py
+    send_teams_message = None
 
 # Register DejaVu Sans font for Polish characters support
 _FONT_REGISTERED = False
@@ -1893,6 +1900,28 @@ def parse_nip(value: str) -> str:
     return val
 
 
+def notify_teams(args, status: str, title: str, text: str = None, facts: dict = None):
+    """Send a Teams webhook notification; never raises."""
+    if not args.teams_webhook_url:
+        return
+    if send_teams_message is None:
+        logger.warning("Moduł teams_notifier.py niedostępny – pomijam powiadomienie Teams")
+        return
+    try:
+        send_teams_message(
+            webhook_url=args.teams_webhook_url,
+            status=status,
+            title=title,
+            text=text,
+            facts=facts,
+            payload_format=args.teams_format,
+            timeout=args.teams_timeout,
+        )
+        print(f"Powiadomienie Teams wysłane ({status}).")
+    except Exception as e:
+        logger.warning(f"Nie udało się wysłać powiadomienia Teams: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Fetch invoices from KSeF (Krajowy System e-Faktur)',
@@ -1914,6 +1943,9 @@ Examples:
     # Self-invoicing only (all original XML/PDF/email options remain available)
     %(prog)s --nip 1234567890 --token-file token.txt --is-self-invoicing --subject-type Subject1 --download-pdf
     %(prog)s --nip 1234567890 --token-file token.txt --isSelfInvoicing true
+
+    # Notify a Teams channel on success/error
+    %(prog)s --nip 1234567890 --token-file token.txt --teams-webhook-url "https://..."
 
     # Offline XML to PDF conversion (no authentication needed)
     %(prog)s --xml-to-pdf faktura.xml
@@ -1984,6 +2016,20 @@ Examples:
                              help='Email subject template (default: "Faktura KSeF: {invoice_number}")')
     email_group.add_argument('--email-group', choices=['single', 'all'], default='single',
                              help='Grouping: single (one email per invoice, default) or all (all in one email)')
+
+    # Microsoft Teams notifications
+    teams_group = parser.add_argument_group('Microsoft Teams notifications')
+    teams_group.add_argument('--teams-webhook-url',
+                             default=os.environ.get('TEAMS_WEBHOOK_URL'),
+                             help='Teams incoming webhook URL (Power Automate). '
+                                  'Fallback: environment variable TEAMS_WEBHOOK_URL')
+    teams_group.add_argument('--teams-notify-on', choices=['all', 'success', 'error'], default='all',
+                             help='When to send notifications (default: all)')
+    teams_group.add_argument('--teams-format', choices=['adaptive', 'card', 'text'], default='adaptive',
+                             help='Message format: adaptive (Power Automate, default), '
+                                  'card (legacy O365 connector), text (plain text)')
+    teams_group.add_argument('--teams-timeout', type=int, default=10,
+                             help='Webhook HTTP request timeout in seconds (default: 10)')
 
     args = parser.parse_args()
 
@@ -2429,16 +2475,37 @@ Examples:
         client.terminate_session()
         print("Sesja zakończona.")
 
+        # Teams notification (success)
+        if args.teams_notify_on in ('all', 'success'):
+            facts = {
+                'NIP': args.nip,
+                'Środowisko': args.env,
+                'Liczba faktur': str(len(invoices)),
+                'Metoda autoryzacji': auth_method,
+                'Zakres dat': (f"{date_from.isoformat()} - {date_to.isoformat()}"
+                               if (date_from or date_to) else None),
+            }
+            facts = {k: v for k, v in facts.items() if v}
+            notify_teams(args, 'success', 'KSeF: pobieranie faktur zakończone sukcesem',
+                         facts=facts)
+
     except KSeFError as e:
         print(f"\nBłąd KSeF: {e.message}", file=sys.stderr)
         if e.response_data:
             print(f"Szczegóły: {json.dumps(e.response_data, indent=2)}", file=sys.stderr)
+        if getattr(args, 'teams_notify_on', 'all') in ('all', 'error'):
+            notify_teams(args, 'error', 'KSeF: błąd pobierania faktur',
+                         text=e.message,
+                         facts={'NIP': args.nip, 'Kod HTTP': str(e.status_code or 'N/A')})
         sys.exit(1)
     except Exception as e:
         print(f"\nNieoczekiwany błąd: {e}", file=sys.stderr)
         if args.verbose:
             import traceback
             traceback.print_exc()
+        if getattr(args, 'teams_notify_on', 'all') in ('all', 'error'):
+            notify_teams(args, 'error', 'KSeF: nieoczekiwany błąd',
+                         text=str(e), facts={'NIP': args.nip})
         sys.exit(1)
 
 

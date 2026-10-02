@@ -44,6 +44,7 @@ nie dodaje odrębnego sprawdzania tego znacznika w pobranym XML.
 | Throttling zapytań | Pauza 0.3s po pobraniu XML z sieci przy masowym przetwarzaniu |
 | Cache z dysku (XML) | Wczytywanie istniejącego pliku XML z dysku bez odpytywania API KSeF |
 | Testy | Filtr, zgodność CLI, NIP nabywcy, PDF/XML, SMTP, retry 429, disk cache i throttling |
+| Powiadomienia Teams | `teams_notifier.py` + flagi `--teams-webhook-url` / `--teams-notify-on` / `--teams-format` |
 
 Pole w JSON wysyłanym do `POST /invoices/query/metadata` jest typu boolean,
 np. `"isSelfInvoicing": true`. Przy braku flagi pole nie jest wysyłane.
@@ -212,6 +213,115 @@ Bez jawnego zakresu oryginał przyjmuje początek 30 dni temu i koniec dzisiaj.
 Daty dotyczą **przyjęcia do KSeF (`Invoicing`)**, zgodnie z domyślnym
 zachowaniem klienta, a nie daty wystawienia zapisanej na fakturze.
 
+## Powiadomienia Microsoft Teams (webhook)
+
+Nowy skrypt `teams_notifier.py` wysyła wiadomość na wybrany kanał Teams po **udanym
+pobieraniu faktur** lub **w razie błędu**. Można go użyć na dwa sposoby:
+
+1. **Natywnie w głównym skrypcie** — flaga `--teams-webhook-url` (zalecane).
+2. **Tryb wrapper** — `teams_notifier.py` uruchamia dowolne polecenie i wysyła
+   powiadomienie na podstawie kodu wyjścia.
+
+### Krok 1 — utwórz webhook w Teams (Power Automate Workflows)
+
+Klasyczne łączniki O365 (*Incoming Webhook*) zostały wycofane przez Microsoft.
+Obecny sposób to przepływ **Workflows**:
+
+1. W Microsoft Teams otwórz kanał, który ma otrzymywać powiadomienia.
+2. Wybierz menu kanału **⋯ → Workflows** (albo wyszukaj aplikację *Workflows*).
+3. Wyszukaj szablon **„Post to a channel when a webhook request is received"**
+   (po polsku: *Publikuj na kanale, gdy odebrane zostanie żądanie webhooka*).
+4. W kreatorze wybierz **zespół i kanał**, następnie kliknij **Utwórz / Add workflow**.
+5. Skopiuj wygenerowany adres **HTTP POST URL** — jest to Twój webhook URL
+   (zaczyna się od `https://*.logic.azure.com/...`).
+6. Trzymaj adres jak sekret: każdy, kto go zna, może publikować na kanale.
+   Najlepiej ustawić go jako zmienną środowiskową `TEAMS_WEBHOOK_URL`, a nie w
+   plikach w repozytorium.
+
+> **Stare łączniki O365:** jeśli organizacja jeszcze je obsługuje
+> (kanał → ⋯ → *Connectors* → *Incoming Webhook*), użyj flagi
+> `--teams-format card` i adresu z łącznika.
+
+### Krok 2 — podaj adres webhooka i uruchom skrypt
+
+Najprostsza forma — flagi w głównym skrypcie:
+
+```sh
+python ksef_faktury_list.py --nip "TWOJ_NIP" --token-file "token.txt" --env prod --subject-type Subject1 --isSelfInvoicing true --buyer-nip 9876543210 --teams-webhook-url "https://twoj-adres.logic.azure.com/..."
+```
+
+- **Sukces** — karta z liczbą pobranych faktur, NIP-em, środowiskiem, metodą
+  autoryzacji i zakresem dat.
+- **Błąd** — karta z komunikatem błędu KSeF i kodem HTTP.
+- Powiadomienie wysyłane jest *po* zamknięciu sesji; wysyłka e-mail i zapis
+  plików dzieją się wcześniej i nie są przez powiadomienie zmieniane.
+- Niepowodzenie wysyłki do Teams nie zmienia kodu wyjścia skryptu (tylko
+  ostrzeżenie w logu).
+
+Dodatkowe flagi:
+
+| Flaga | Znaczenie |
+|---|---|
+| `--teams-webhook-url` | Adres webhooka (albo zmienna `TEAMS_WEBHOOK_URL`) |
+| `--teams-notify-on all\|success\|error` | Kiedy wysyłać (domyślnie `all`) |
+| `--teams-format adaptive\|card\|text` | Format wiadomości (domyślnie `adaptive` dla Power Automate) |
+| `--teams-timeout 10` | Timeout żądania HTTP w sekundach |
+
+### Krok 3 — tryb wrapper (bez zmian w wywołaniu głównego skryptu)
+
+`teams_notifier.py` uruchamia polecenie i wysyła powiadomienie o wyniku
+(parsuje z wyjścia m.in. liczbę faktur `Razem: N`):
+
+```sh
+python teams_notifier.py --webhook-url "https://twoj-adres.logic.azure.com/..." -- python ksef_faktury_list.py --nip "TWOJ_NIP" --token-file "token.txt" --env prod --subject-type Subject1 --isSelfInvoicing true
+```
+
+Opcje wrappera: `--notify-on all|success|error`, `--status`, `--message`,
+`--format`, `--timeout`. Kod wyjścia wrappera jest równy kodowi wyjścia
+uruchomionego polecenia.
+
+### Krok 4 — test ręczny
+
+```sh
+python teams_notifier.py --webhook-url "https://twoj-adres.logic.azure.com/..." --status success --message "Test powiadomień KSeF"
+```
+
+Wiadomość powinna pojawić się na kanale. Jeśli nie — sprawdź, czy przepływ
+Workflows jest włączony, a adres skopiowany w całości.
+
+### Przykład: harmonogram zadań Windows
+
+Plik `run_ksef_teams.ps1`:
+
+```powershell
+$env:TEAMS_WEBHOOK_URL = "https://twoj-adres.logic.azure.com/..."
+$dateFrom = (Get-Date).AddDays(-2).ToString('yyyy-MM-dd')
+$dateTo = (Get-Date).ToString('yyyy-MM-dd')
+python teams_notifier.py -- python ksef_faktury_list.py `
+    --nip "TWOJ_NIP" --token-file "token.txt" --env prod `
+    --subject-type Subject1 --isSelfInvoicing true --buyer-nip 9876543210 `
+    --date-from $dateFrom --date-to $dateTo `
+    --download-pdf --pdf-output-dir "./output/pdf"
+```
+
+W Harmonogramie zadań Windows dodaj zadanie z programem `pwsh.exe`
+i argumentem `-File run_ksef_teams.ps1`. Na Linuksie wystarczy cron:
+
+```sh
+0 7 * * 1-5 cd /sciezka/do/projektu && TEAMS_WEBHOOK_URL="https://..." python teams_notifier.py -- python ksef_faktury_list.py --nip TWOJ_NIP --token-file token.txt --isSelfInvoicing true
+```
+
+### Formaty wiadomości
+
+| Format | Kiedy użyć |
+|---|---|
+| `adaptive` (domyślny) | Power Automate Workflows — szablon „Post to a channel when a webhook request is received" |
+| `card` | Stary łącznik O365 (*Incoming Webhook*, MessageCard) |
+| `text` | Własny przepływ Power Automate odczytujący pole `text` |
+
+Dostarczanie ma wbudowane ponowienia (3 próby, uwzględnia nagłówek
+`Retry-After`), więc chwilowa niedostępność Power Automate nie przerywa pracy.
+
 ## Użycie z kodu Python
 
 ```python
@@ -236,7 +346,7 @@ finally:
 ## Testy i zakres weryfikacji
 
 ```sh
-python -m unittest -v test_self_invoicing.py
+python -m unittest -v test_self_invoicing.py test_teams_notifier.py
 ```
 
 Testy działają offline i sprawdzają:
@@ -249,6 +359,8 @@ Testy działają offline i sprawdzają:
 6. Pomijanie zapytań do API KSeF w przypadku obecności pliku XML na dysku (disk cache).
 7. Weryfikację throttlingu (0.3s) po pobraniu dokumentu z API.
 8. Filtrowanie faktur po NIP nabywcy (dla `buyer_nip` w kodzie i CLI, różne formaty zapisu, wczesna walidacja).
+9. Powiadomienia Teams: budowanie kart (adaptive/card/text), ponawianie wysyłki webhooka, tryb wrapper
+   `teams_notifier.py` oraz hooki sukcesu/błędu w głównym skrypcie (brak wysyłki bez webhooka).
 
 KSeF i SMTP są w testach zastąpione atrapami. Żaden test nie wysyła prawdziwego
 e-maila. Testy nie potwierdzają działania konkretnego tokenu produkcyjnego
