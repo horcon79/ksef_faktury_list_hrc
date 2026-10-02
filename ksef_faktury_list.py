@@ -2069,11 +2069,16 @@ Examples:
     token = None
     if use_token_auth:
         token = args.token
-        if not token and args.token_file:
+        if token and os.path.isfile(token):
+            # Użytkownik przekazał ścieżkę do pliku w --token zamiast --token-file
+            print(f"Informacja: Parametr --token wskazuje na istniejący plik ({token}). Wczytuję token z tego pliku.")
+            with open(token, 'r', encoding='utf-8-sig') as f:
+                token = f.read().strip()
+        elif not token and args.token_file:
             if not os.path.exists(args.token_file):
                 print(f"Błąd: Plik tokenu nie znaleziony: {args.token_file}", file=sys.stderr)
                 sys.exit(1)
-            with open(args.token_file, 'r') as f:
+            with open(args.token_file, 'r', encoding='utf-8-sig') as f:
                 token = f.read().strip()
         if not token:
             print("Błąd: Token jest pusty", file=sys.stderr)
@@ -2087,7 +2092,7 @@ Examples:
             if not os.path.exists(args.password_file):
                 print(f"Błąd: Plik hasła nie znaleziony: {args.password_file}", file=sys.stderr)
                 sys.exit(1)
-            with open(args.password_file, 'r') as f:
+            with open(args.password_file, 'r', encoding='utf-8-sig') as f:
                 password = f.read().strip()
 
         # Validate certificate files
@@ -2261,7 +2266,7 @@ Examples:
                 if not os.path.exists(args.smtp_password_file):
                     print(f"Błąd: Plik hasła SMTP nie znaleziony: {args.smtp_password_file}", file=sys.stderr)
                     sys.exit(1)
-                with open(args.smtp_password_file, 'r') as f:
+                with open(args.smtp_password_file, 'r', encoding='utf-8-sig') as f:
                     smtp_password = f.read().strip()
             if not smtp_password:
                 missing.append('--smtp-password or --smtp-password-file')
